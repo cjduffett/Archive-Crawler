@@ -62,6 +62,9 @@ class ArchiveCrawler(object):
         self._pbar.term_width   = 80
         self._pbar.maxval       = 100  # out of 100%
         self.__progress         = 0
+        
+        self.failures       = list()  # holds apk names that failed to download
+        self.num_downloads  = 0
        
     
     def __unicode__(self):
@@ -74,26 +77,6 @@ class ArchiveCrawler(object):
     
     def version(self):
         print "Archive Crawler " + self._version
-        
-
-    def __process_meta(self, r, **kwargs):
-        '''
-            Callback for each asynchronous metadata request.
-        '''
-        
-        # parse html index file links for apk names
-        matches = re.findall(r'(>[\w\.\-]+apk)',r.text)[2:]  # first two items are garbage
-        r.close()
-        repo = r.url.split('/')[-2]  # recover repository name from request
-        
-        # store parsed apk names
-        self.num_apks += len(matches)
-        for match in matches:
-            self.apks.append(repo + '/' + match[1:])
-        
-        if self.__progress < 99:  # hang at 99% until complete
-            self.__progress += 0.5
-            self._pbar.update(self.__progress)
         
 
     def index_archive(self):
@@ -145,6 +128,26 @@ class ArchiveCrawler(object):
         print str(self.num_apks) + " apks found"
 
 
+    def __process_meta(self, r, **kwargs):
+        '''
+            Callback for each asynchronous metadata request.
+        '''
+        
+        # parse html index file links for apk names
+        matches = re.findall(r'(>[\w\.\-]+apk)',r.text)[2:]  # first two items are garbage
+        r.close()
+        repo = r.url.split('/')[-2]  # recover repository name from request
+        
+        # store parsed apk names
+        self.num_apks += len(matches)
+        for match in matches:
+            self.apks.append(repo + '/' + match[1:])
+        
+        if self.__progress < 99:  # hang at 99% until complete
+            self.__progress += 0.5
+            self._pbar.update(self.__progress)
+            
+            
     def load(self, filename='apks.txt'):
         '''
             Loads apk metadata previously saved to specified <filename>.
@@ -181,22 +184,16 @@ class ArchiveCrawler(object):
                 return
             
             self._pbar.start()
+            self._pbar.update(34)  # arbitrary, for effect
             
-            # process metadata from file
-            self.__progress = 0
-            self._pbar.maxval = len(lines) - 1
-            
+            # process metadata from file  
             for line in lines[1:]:
                 self.apks.append(line[:-1])
-                
-                self.__progress += 1
-                if self.__progress < self._pbar.maxval:
-                    self._pbar.update(self.__progress)
                     
                 repo = line.split('/')[0]
                 if not repo in self.repos:
                     self.repos.append(repo)
-            
+                    
             f.close()
             self.num_apks = len(self.apks)  
             self.num_repos = len(self.repos)
@@ -251,52 +248,67 @@ class ArchiveCrawler(object):
         
         # init progress bar
         self._pbar.start()
-        self._pbar.maxval = self.num_apks
         
         # write number of apk names to first line of file
         f.write(str(self.num_apks) + '\n')
         
         # write apk names and update progress
-        for i in range(self.num_apks):
-            f.write(self.apks[i] + '\n')
-            self._pbar.update(i)
-
+        f.write('\n'.join(self.apks))
+        self.__progress = 60  # arbitrary, for effect
+        self._pbar.update(self.__progress)
+        f.write('\n')
         f.close()
         self._pbar.finish()
-        self._pbar.maxval = 100  # reset progress bar to defaults
 
         print str(self.num_apks) + " apk names written to " + filename
 
        
-    def download(target_dir='apks/', metadata='apks.txt', num_apks=None):
+    def download(self, num_apks, target_dir='apks/'):
         '''
-            Downloads the apk files obtained by get_apk_names(). If no target directory
-            is specified, the apks are written locally to ./apks/. By default, apk names
-            stored in ./apks.txt are used. If you decided to use another file to store
-            your apk metadata, be sure to specify it.
+            Downloads the specified number of apk files from archive.org. If no
+            target directory is specified, the apks are written locally to apks/.
+            To download EVERY apk file, pass 'all' instead of an integer, e.g.:
+            
+            c.download('all')
         '''
         
         if len(target_dir) == 0:
             print "invalid target directory name"
             return
-            
-        if len(metadata) == 0:
-            print "invalid metadata file name"
-            return
 
-        if num_apks:
-            num_apks = int(num_apks)
+        if str(num_apks).lower() == 'all':
+            num_apks = self.num_apks
+        
+        else:
+            try:
+                num_apks = int(num_apks)
+            
+            except ValueError as err:
+                print "invalid number of apks specified"
+                return
+                
             if num_apks < 1:
                 print "invalid number of apks specified"
                 return
+                
+        # check that apk metadata is already loaded
+        if not self.apks:
+            
+            # attempt to read metadata from file
+            print "no metadata loaded, looking for metadata file ..."
+            self.load()
+            
+            if not self.apks:
+                print "no metadata found, use index_archive() to generate new metadata"
+                return      
         
-        # check that specified metadata file exists
-        if not os.path.isfile(metadata):
-            print "could not locate metadata file " + metadata
+        if num_apks > self.num_apks:
+            print "exceeded number of available apks"
             return
         
         # check to see if the <target_dir> directory currently exists
-        # if so, append an integer to the directory name
+        # if so, append an integer to the directory name and try again
+        # e.g. apks/ -> apks1/ -> apks2/ etc.
         if not target_dir[-1] == '/':
             target_dir += '/'
             
@@ -315,59 +327,71 @@ class ArchiveCrawler(object):
             
         # create new directory for apks
         os.mkdir(target_dir)
-        
-        # read metadata file
-        f = open(metadata, 'r')
-        apk_names = f.readlines()
-        f.close()
-        
-        # strip trailing newline
-        apk_names = [apk_name.rstrip('\n') for apk_name in apk_names]
-        
-        if not num_apks:
-            # if limit not specified, download all apks
-            num_apks = len(apk_names)
-        
+                
         # init progress bar
-        print "downloading " + str(num_apks) + " apks from archive.org/download/"
-        pbar = ProgressBar().start()
-        pbar.term_width = 80
-        pbar.maxval = num_apks
+        print "downloading " + str(num_apks) + " apks from " + self.download_url
+        self._pbar.start()
+        self._pbar.maxval = num_apks
         
         # download apks
-        apk_download_url = "http://archive.org/download/"
-        failures = list()
+        self.num_downloads = 0
+        del self.failures[:]
+        
         for i in range(num_apks):
             try:
-                url = apk_download_url + apk_names[i]
-                _download_large_file(url, target_dir)
+                url = self.download_url + self.apks[i]
+                self.__download_large_file(url, target_dir)
+                self.num_downloads += 1
                 
             except (_DownloadError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as err:
                 # note if an apk fails to download, but do not terminate
-                failures.append(apk_names[i])
+                self.failures.append(apk_names[i])
                 
-            pbar.update(i + 1)
+            except KeyboardInterrupt as err:
+                self._pbar.finish()
+                self._pbar.maxval = 100
+                print "download interrupted, " + str(self.num_downloads) + " apks downloaded"
+                return
+                
+            self._pbar.update(i + 1)
         
-        pbar.finish()   
-        print "successfully downloaded " + str(num_apks - len(failures)) + " apks to " + target_dir
-        if failures:
+        self._pbar.finish()
+        self._pbar.maxval = 100  # restore default
+        self.__progress = 0
+        
+        print "successfully downloaded " + str(num_apks - len(self.failures)) + " apks to " + target_dir
+        
+        if self.failures:
             print "the following items failed to download:"
-            for fail in failures:
+            for fail in self.failures:
                 print fail
 
 
-    def _download_large_file(url, target_dir):
-        '''mutipart download of large apk files'''
-        local_filename = target_dir + url.split('/')[-1]
-        r = requests.get(url, stream=True)
+    def __download_large_file(self, url, target_dir):
+        '''
+            mutipart download of large apk files
+        '''
         
-        if r.status_code == 404:
-            raise _DownloadError(local_filename)
-        
-        with open(local_filename, 'wb') as f:
-            for chunk in r.iter_content(chunk_size=1024):
-                if chunk: # filter out keep-alive new chunks
-                    f.write(chunk)     
-            f.close()
+        try:
+            local_filename = target_dir + url.split('/')[-1]
+            r = requests.get(url, stream=True)
             
-        return local_filename
+            if r.status_code == 404:
+                raise _DownloadError(local_filename)
+            
+            with open(local_filename, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=1024):
+                    if chunk: # filter out keep-alive new chunks
+                        f.write(chunk)     
+                f.close()
+            
+            return local_filename
+            
+        except KeyboardInterrupt as err:
+            # cleanup
+            if f:
+                f.close()
+                os.remove(local_filename)
+                
+            raise KeyboardInterrupt
+            
