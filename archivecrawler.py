@@ -23,7 +23,6 @@ import re
 import os
 import math
 from progressbar import ProgressBar
-from multiprocessing import Pool
 
 
 class _DownloadError(Exception):
